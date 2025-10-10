@@ -10,16 +10,16 @@ compatibility_date = "2024-06-13"
 # 如果您有可用的 KV 命名空间，请取消注释并填入正确的 ID
 [[kv_namespaces]]
 binding = "MISUB_KV"
-id = "YOUR_KV_NAMESPACE_ID"  # 替换为您的真实 KV 命名空间 ID
-preview_id = "YOUR_PREVIEW_KV_ID"  # 替换为您的预览 KV 命名空间 ID
+id = "604f08d7bcc246e1a5651f781ca9d746"  # 替换为您的真实 KV 命名空间 ID
+preview_id = "604f08d7bcc246e1a5651f781ca9d746"  # 替换为您的预览 KV 命名空间 ID
 
 # D1 数据库绑定（推荐）
 # 如果您有可用的 D1 数据库，请取消注释并填入正确的 ID
 [[d1_databases]]
 binding = "MISUB_DB"
 database_name = "misub"
-database_id = "YOUR_D1_DATABASE_ID"  # 替换为您的真实 D1 数据库 ID
-preview_database_id = "YOUR_D1_DATABASE_ID"  # 替换为您的真实 D1 数据库 ID
+database_id = "7bcf71cd-24db-4027-92e9-307e9290abc1"  # 替换为您的真实 D1 数据库 ID
+preview_database_id = "7bcf71cd-24db-4027-92e9-307e9290abc1"  # 替换为您的真实 D1 数据库 ID
 
 # 环境变量配置
 [env.production.vars]
