@@ -1,7 +1,7 @@
 /**
- * 数据存储抽象层
+ * 数据存储适配器
  * 支持 KV 和 D1 两种存储方式
- * 根据设置自动选择存储类型
+ * 提供统一的数据存储访问接口
  */
 
 // 存储类型常量
@@ -13,7 +13,7 @@ export const STORAGE_TYPES = {
 // 数据键映射
 const DATA_KEYS = {
     SUBSCRIPTIONS: 'misub_subscriptions_v1',
-    PROFILES: 'misub_profiles_v1', 
+    PROFILES: 'misub_profiles_v1',
     SETTINGS: 'worker_settings_v1'
 };
 
@@ -55,14 +55,18 @@ class KVStorageAdapter {
         }
     }
 
-    async list(prefix) {
+    async list(prefix = '') {
         try {
             const result = await this.kv.list({ prefix });
-            return result.keys || [];
+            return result.keys.map(key => key.name);
         } catch (error) {
             console.error(`[KV] Failed to list keys with prefix ${prefix}:`, error);
             return [];
         }
+    }
+
+    getType() {
+        return STORAGE_TYPES.KV;
     }
 }
 
@@ -76,16 +80,10 @@ class D1StorageAdapter {
 
     async get(key, type = 'json') {
         try {
-            // 根据 key 确定查询的表和字段
-            const { table, queryField, queryValue } = this._parseKey(key);
-
-            const result = await this.db.prepare(
-                `SELECT ${table === 'settings' ? 'value as data' : 'data'} FROM ${table} WHERE ${queryField} = ?`
-            ).bind(queryValue).first();
-
+            const result = await this.db.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first();
             if (!result) return null;
-
-            return type === 'json' ? JSON.parse(result.data) : result.data;
+            
+            return type === 'json' ? JSON.parse(result.value) : result.value;
         } catch (error) {
             console.error(`[D1] Failed to get key ${key}:`, error);
             return null;
@@ -94,23 +92,11 @@ class D1StorageAdapter {
 
     async put(key, value) {
         try {
-            const { table, queryField, queryValue } = this._parseKey(key);
             const data = typeof value === 'string' ? value : JSON.stringify(value);
-
-            if (table === 'settings') {
-                // settings 表使用 key-value 结构
-                await this.db.prepare(`
-                    INSERT OR REPLACE INTO ${table} (key, value, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                `).bind(queryValue, data).run();
-            } else {
-                // subscriptions 和 profiles 表使用 id-data 结构
-                await this.db.prepare(`
-                    INSERT OR REPLACE INTO ${table} (id, data, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                `).bind(queryValue, data).run();
-            }
-
+            await this.db.prepare(`
+                INSERT OR REPLACE INTO settings (key, value, updated_at) 
+                VALUES (?, ?, datetime('now'))
+            `).bind(key, data).run();
             return true;
         } catch (error) {
             console.error(`[D1] Failed to put key ${key}:`, error);
@@ -120,12 +106,7 @@ class D1StorageAdapter {
 
     async delete(key) {
         try {
-            const { table, queryField, queryValue } = this._parseKey(key);
-
-            await this.db.prepare(
-                `DELETE FROM ${table} WHERE ${queryField} = ?`
-            ).bind(queryValue).run();
-
+            await this.db.prepare('DELETE FROM settings WHERE key = ?').bind(key).run();
             return true;
         } catch (error) {
             console.error(`[D1] Failed to delete key ${key}:`, error);
@@ -133,150 +114,112 @@ class D1StorageAdapter {
         }
     }
 
-    async list(prefix) {
+    async list(prefix = '') {
         try {
-            // D1 中的 list 操作需要根据前缀查询相应的表
-            const tables = [
-                { name: 'subscriptions', keyField: 'id' },
-                { name: 'profiles', keyField: 'id' },
-                { name: 'settings', keyField: 'key' }
-            ];
-            const keys = [];
-
-            for (const table of tables) {
-                const results = await this.db.prepare(
-                    `SELECT ${table.keyField} FROM ${table.name}`
-                ).all();
-
-                results.results.forEach(row => {
-                    const key = this._buildKey(table.name, row[table.keyField]);
-                    if (key.startsWith(prefix)) {
-                        keys.push({ name: key });
-                    }
-                });
-            }
-
-            return keys;
+            const result = await this.db.prepare('SELECT key FROM settings WHERE key LIKE ?').bind(`${prefix}%`).all();
+            return result.results.map(row => row.key);
         } catch (error) {
             console.error(`[D1] Failed to list keys with prefix ${prefix}:`, error);
             return [];
         }
     }
 
-    /**
-     * 解析 key，确定对应的表、查询字段和查询值
-     */
-    _parseKey(key) {
-        if (key === DATA_KEYS.SUBSCRIPTIONS) {
-            return { table: 'subscriptions', queryField: 'id', queryValue: 'main' };
-        } else if (key === DATA_KEYS.PROFILES) {
-            return { table: 'profiles', queryField: 'id', queryValue: 'main' };
-        } else if (key === DATA_KEYS.SETTINGS) {
-            return { table: 'settings', queryField: 'key', queryValue: 'main' };
-        } else {
-            // 处理其他格式的 key，默认作为 settings 表的 key，但记录警告
-            console.warn(`[D1 Storage] Unknown key format: ${key}, treating as settings key`);
-            return { table: 'settings', queryField: 'key', queryValue: key };
-        }
+    getType() {
+        return STORAGE_TYPES.D1;
     }
 
-    /**
-     * 构建 key
-     */
-    _buildKey(table, keyValue) {
-        if (table === 'subscriptions' && keyValue === 'main') {
-            return DATA_KEYS.SUBSCRIPTIONS;
-        } else if (table === 'profiles' && keyValue === 'main') {
-            return DATA_KEYS.PROFILES;
-        } else if (table === 'settings' && keyValue === 'main') {
-            return DATA_KEYS.SETTINGS;
-        } else {
-            return keyValue;
+    // D1 特有方法：初始化数据库表
+    async initTables() {
+        try {
+            // 创建 subscriptions 表
+            await this.db.prepare(`
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            `).run();
+
+            // 创建 profiles 表
+            await this.db.prepare(`
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            `).run();
+
+            // 创建 settings 表
+            await this.db.prepare(`
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            `).run();
+
+            // 创建索引
+            await this.db.prepare('CREATE INDEX IF NOT EXISTS idx_subscriptions_updated_at ON subscriptions(updated_at)').run();
+            await this.db.prepare('CREATE INDEX IF NOT EXISTS idx_profiles_updated_at ON profiles(updated_at)').run();
+            await this.db.prepare('CREATE INDEX IF NOT EXISTS idx_settings_updated_at ON settings(updated_at)').run();
+
+            console.log('[D1] Database tables initialized successfully');
+            return true;
+        } catch (error) {
+            console.error('[D1] Failed to initialize tables:', error);
+            throw error;
         }
     }
 }
 
 /**
  * 存储工厂类
- * 根据配置创建相应的存储适配器
  */
 export class StorageFactory {
-    /**
-     * 创建存储适配器
-     * @param {Object} env - Cloudflare 环境对象
-     * @param {string} storageType - 存储类型 ('kv' | 'd1')
-     * @returns {KVStorageAdapter|D1StorageAdapter}
-     */
-    static createAdapter(env, storageType = STORAGE_TYPES.KV) {
-        switch (storageType) {
-            case STORAGE_TYPES.D1:
-                if (!env.MISUB_DB) {
-                    console.warn('[Storage] D1 database not available, falling back to KV');
-                    return new KVStorageAdapter(env.MISUB_KV);
-                }
-                return new D1StorageAdapter(env.MISUB_DB);
-            
+    static create(type, resource) {
+        switch (type) {
             case STORAGE_TYPES.KV:
-            default:
-                return new KVStorageAdapter(env.MISUB_KV);
-        }
-    }
-
-    /**
-     * 获取当前存储类型设置
-     * @param {Object} env - Cloudflare 环境对象
-     * @returns {Promise<string>} 存储类型
-     */
-    static async getStorageType(env) {
-        try {
-            // 优先从 D1 读取设置（若已切换到 D1，则后续请求不会触碰 KV）
-            if (env.MISUB_DB) {
-                try {
-                    const d1Adapter = new D1StorageAdapter(env.MISUB_DB);
-                    const d1Settings = await d1Adapter.get(DATA_KEYS.SETTINGS);
-                    if (d1Settings?.storageType) {
-                        return d1Settings.storageType;
-                    }
-                } catch (d1Error) {
-                    console.warn('[Storage] Failed to read from D1:', d1Error.message);
+                if (!resource) {
+                    throw new Error('KV namespace is required for KV storage');
                 }
-            }
-
-            // 回退：从 KV 读取设置（默认仍支持 KV）
-            let settings = null;
-            try {
-                settings = await env.MISUB_KV.get(DATA_KEYS.SETTINGS, 'json');
-            } catch (kvError) {
-                console.warn('[Storage] Failed to read from KV:', kvError.message);
-            }
-            if (settings?.storageType) {
-                return settings.storageType;
-            }
-
-            // 默认使用 KV
-            return STORAGE_TYPES.KV;
-        } catch (error) {
-            console.error('[Storage] Failed to get storage type:', error);
-            return STORAGE_TYPES.KV;
+                return new KVStorageAdapter(resource);
+            
+            case STORAGE_TYPES.D1:
+                if (!resource) {
+                    throw new Error('D1 database is required for D1 storage');
+                }
+                const adapter = new D1StorageAdapter(resource);
+                // 自动初始化表结构
+                adapter.initTables().catch(error => {
+                    console.warn('[D1] Failed to auto-initialize tables:', error);
+                });
+                return adapter;
+            
+            default:
+                throw new Error(`Unsupported storage type: ${type}`);
         }
     }
 }
 
 /**
- * 数据迁移工具
+ * 数据迁移器
  */
 export class DataMigrator {
-    /**
-     * 从 KV 迁移到 D1
-     * @param {Object} env - Cloudflare 环境对象
-     * @returns {Promise<Object>} 迁移结果
-     */
-    static async migrateKVToD1(env) {
-        try {
-            const kvAdapter = new KVStorageAdapter(env.MISUB_KV);
-            const d1Adapter = new D1StorageAdapter(env.MISUB_DB);
+    constructor(env) {
+        this.env = env;
+    }
 
-            const results = {
+    async migrate(fromType, toType) {
+        console.log(`Starting migration from ${fromType} to ${toType}`);
+        
+        try {
+            const fromStorage = StorageFactory.create(fromType, this.getResource(fromType));
+            const toStorage = StorageFactory.create(toType, this.getResource(toType));
+            
+            const migrationResults = {
                 subscriptions: false,
                 profiles: false,
                 settings: false,
@@ -285,43 +228,103 @@ export class DataMigrator {
 
             // 迁移订阅数据
             try {
-                const subscriptions = await kvAdapter.get(DATA_KEYS.SUBSCRIPTIONS);
+                const subscriptions = await fromStorage.get(DATA_KEYS.SUBSCRIPTIONS);
                 if (subscriptions) {
-                    await d1Adapter.put(DATA_KEYS.SUBSCRIPTIONS, subscriptions);
-                    results.subscriptions = true;
+                    await toStorage.put(DATA_KEYS.SUBSCRIPTIONS, subscriptions);
+                    migrationResults.subscriptions = true;
+                    console.log('[Migration] Subscriptions migrated successfully');
                 }
             } catch (error) {
-                results.errors.push(`订阅数据迁移失败: ${error.message}`);
+                migrationResults.errors.push(`Subscriptions: ${error.message}`);
+                console.error('[Migration] Failed to migrate subscriptions:', error);
             }
 
-            // 迁移配置文件
+            // 迁移配置文件数据
             try {
-                const profiles = await kvAdapter.get(DATA_KEYS.PROFILES);
+                const profiles = await fromStorage.get(DATA_KEYS.PROFILES);
                 if (profiles) {
-                    await d1Adapter.put(DATA_KEYS.PROFILES, profiles);
-                    results.profiles = true;
+                    await toStorage.put(DATA_KEYS.PROFILES, profiles);
+                    migrationResults.profiles = true;
+                    console.log('[Migration] Profiles migrated successfully');
                 }
             } catch (error) {
-                results.errors.push(`配置文件迁移失败: ${error.message}`);
+                migrationResults.errors.push(`Profiles: ${error.message}`);
+                console.error('[Migration] Failed to migrate profiles:', error);
             }
 
-            // 迁移设置
+            // 迁移设置数据
             try {
-                const settings = await kvAdapter.get(DATA_KEYS.SETTINGS);
+                const settings = await fromStorage.get(DATA_KEYS.SETTINGS);
                 if (settings) {
-                    // 更新存储类型为 D1
-                    settings.storageType = STORAGE_TYPES.D1;
-                    await d1Adapter.put(DATA_KEYS.SETTINGS, settings);
-                    results.settings = true;
+                    await toStorage.put(DATA_KEYS.SETTINGS, settings);
+                    migrationResults.settings = true;
+                    console.log('[Migration] Settings migrated successfully');
                 }
             } catch (error) {
-                results.errors.push(`设置迁移失败: ${error.message}`);
+                migrationResults.errors.push(`Settings: ${error.message}`);
+                console.error('[Migration] Failed to migrate settings:', error);
             }
 
-            return results;
+            console.log('[Migration] Migration completed:', migrationResults);
+            return migrationResults;
+
         } catch (error) {
-            console.error('[Migration] Failed to migrate KV to D1:', error);
+            console.error('[Migration] Migration failed:', error);
             throw error;
         }
     }
+
+    getResource(type) {
+        switch (type) {
+            case STORAGE_TYPES.KV:
+                return this.env.MISUB_KV;
+            case STORAGE_TYPES.D1:
+                return this.env.MISUB_DB;
+            default:
+                throw new Error(`Unknown storage type: ${type}`);
+        }
+    }
 }
+
+/**
+ * 存储健康检查器
+ */
+export class StorageHealthChecker {
+    static async check(storage) {
+        const health = {
+            type: storage.getType(),
+            available: false,
+            readable: false,
+            writable: false,
+            error: null
+        };
+
+        try {
+            // 测试读取
+            const testKey = 'health_check_test';
+            const testValue = { timestamp: Date.now(), test: true };
+            
+            // 测试写入
+            await storage.put(testKey, testValue);
+            health.writable = true;
+            
+            // 测试读取
+            const retrieved = await storage.get(testKey);
+            health.readable = retrieved !== null;
+            
+            // 清理测试数据
+            await storage.delete(testKey);
+            
+            health.available = health.readable && health.writable;
+            
+        } catch (error) {
+            health.error = error.message;
+            console.error(`[HealthCheck] Storage health check failed for ${health.type}:`, error);
+        }
+
+        return health;
+    }
+}
+
+// 导出数据键常量供外部使用
+export { DATA_KEYS };
