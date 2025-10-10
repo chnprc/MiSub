@@ -1,4 +1,5 @@
-import yaml from 'js-yaml';
+// 移除 js-yaml 依赖，使用内置 JSON 处理
+// import yaml from 'js-yaml'; // 已移除
 import { StorageFactory, DataMigrator, STORAGE_TYPES } from './storage-adapter.js';
 
 /**
@@ -184,8 +185,56 @@ const batchWriteManager = new BatchWriteManager();
  * @returns {Promise<Object>} 存储适配器实例
  */
 async function getStorageAdapter(env) {
-    const storageType = await StorageFactory.getStorageType(env);
+    // 智能存储选择逻辑
+    const storageType = await getStorageType(env);
     return StorageFactory.createAdapter(env, storageType);
+}
+
+/**
+ * 智能获取存储类型
+ * @param {Object} env - Cloudflare 环境对象
+ * @returns {Promise<string>} 存储类型
+ */
+async function getStorageType(env) {
+    // 1. 检查环境变量设置
+    if (env.STORAGE_TYPE) {
+        const envType = env.STORAGE_TYPE.toLowerCase();
+        if (envType === 'd1' && env.MISUB_DB) return STORAGE_TYPES.D1;
+        if (envType === 'kv' && env.MISUB_KV) return STORAGE_TYPES.KV;
+    }
+
+    // 2. 检查用户设置（优先从 D1 读取）
+    if (env.MISUB_DB) {
+        try {
+            const d1Adapter = StorageFactory.createAdapter(env, STORAGE_TYPES.D1);
+            const settings = await d1Adapter.get(KV_KEY_SETTINGS);
+            if (settings?.storageType === STORAGE_TYPES.D1) {
+                return STORAGE_TYPES.D1;
+            }
+        } catch (error) {
+            console.warn('[Storage] Failed to read D1 settings:', error.message);
+        }
+    }
+
+    // 3. 检查 KV 设置
+    if (env.MISUB_KV) {
+        try {
+            const kvAdapter = StorageFactory.createAdapter(env, STORAGE_TYPES.KV);
+            const settings = await kvAdapter.get(KV_KEY_SETTINGS);
+            if (settings?.storageType === STORAGE_TYPES.D1 && env.MISUB_DB) {
+                return STORAGE_TYPES.D1;
+            }
+        } catch (error) {
+            console.warn('[Storage] Failed to read KV settings:', error.message);
+        }
+    }
+
+    // 4. 智能回退：优先使用可用的存储
+    if (env.MISUB_DB) return STORAGE_TYPES.D1;
+    if (env.MISUB_KV) return STORAGE_TYPES.KV;
+
+    // 5. 默认回退到 KV
+    return STORAGE_TYPES.KV;
 }
 
 /**
@@ -235,7 +284,7 @@ const defaultSettings = {
   },
   NotifyThresholdDays: 3,
   NotifyThresholdPercent: 90,
-  storageType: 'kv' // 新增：数据存储类型，默认 KV，可选 'd1'
+  storageType: 'auto' // 智能存储选择
 };
 
 const formatBytes = (bytes, decimals = 2) => {
@@ -525,6 +574,7 @@ async function checkAndNotify(sub, settings, env) {
 async function handleApiRequest(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/^\/api/, '');
+    
     // [新增] 数据存储迁移接口 (KV -> D1)
     if (path === '/migrate_to_d1') {
         if (!await authMiddleware(request, env)) {
@@ -722,85 +772,85 @@ async function handleApiRequest(request, env) {
             }
         }
 
-            case '/node_count': {
-                if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
-                const { url: subUrl } = await request.json();
-                if (!subUrl || typeof subUrl !== 'string' || !/^https?:\/\//.test(subUrl)) {
-                    return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
-                }
-                
-                const result = { count: 0, userInfo: null };
-
-                try {
-                    const fetchOptions = {
-                        headers: { 'User-Agent': 'MiSub-Node-Counter/2.0' },
-                        redirect: "follow",
-                        cf: { insecureSkipVerify: true }
-                    };
-                    const trafficFetchOptions = {
-                        headers: { 'User-Agent': 'Clash for Windows/0.20.39' },
-                        redirect: "follow",
-                        cf: { insecureSkipVerify: true }
-                    };
-
-                    const trafficRequest = fetch(new Request(subUrl, trafficFetchOptions));
-                    const nodeCountRequest = fetch(new Request(subUrl, fetchOptions));
-
-                    // --- [核心修正] 使用 Promise.allSettled 替换 Promise.all ---
-                    const responses = await Promise.allSettled([trafficRequest, nodeCountRequest]);
-
-                    // 1. 处理流量请求的结果
-                    if (responses[0].status === 'fulfilled' && responses[0].value.ok) {
-                        const trafficResponse = responses[0].value;
-                        const userInfoHeader = trafficResponse.headers.get('subscription-userinfo');
-                        if (userInfoHeader) {
-                            const info = {};
-                            userInfoHeader.split(';').forEach(part => {
-                                const [key, value] = part.trim().split('=');
-                                if (key && value) info[key] = /^\d+$/.test(value) ? Number(value) : value;
-                            });
-                            result.userInfo = info;
-                        }
-                    } else if (responses[0].status === 'rejected') {
-                        // 流量请求失败
-                    }
-
-                    // 2. 处理节点数请求的结果
-                    if (responses[1].status === 'fulfilled' && responses[1].value.ok) {
-                        const nodeCountResponse = responses[1].value;
-                        const text = await nodeCountResponse.text();
-                        let decoded = '';
-                        try { decoded = atob(text.replace(/\s/g, '')); } catch { decoded = text; }
-                        const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//gm);
-                        if (lineMatches) {
-                            result.count = lineMatches.length;
-                        }
-                    } else if (responses[1].status === 'rejected') {
-                        // 节点数请求失败
-                    }
-                    
-                    // {{ AURA-X: Modify - 使用存储适配器优化节点计数更新. Approval: 寸止(ID:1735459200). }}
-                    // 只有在至少获取到一个有效信息时，才更新数据库
-                    if (result.userInfo || result.count > 0) {
-                        const storageAdapter = await getStorageAdapter(env);
-                        const originalSubs = await storageAdapter.get(KV_KEY_SUBS) || [];
-                        const allSubs = JSON.parse(JSON.stringify(originalSubs)); // 深拷贝
-                        const subToUpdate = allSubs.find(s => s.url === subUrl);
-
-                        if (subToUpdate) {
-                            subToUpdate.nodeCount = result.count;
-                            subToUpdate.userInfo = result.userInfo;
-
-                            await storageAdapter.put(KV_KEY_SUBS, allSubs);
-                        }
-                    }
-                    
-                } catch (e) {
-                    // 节点计数处理错误
-                }
-                
-                return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+        case '/node_count': {
+            if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+            const { url: subUrl } = await request.json();
+            if (!subUrl || typeof subUrl !== 'string' || !/^https?:\/\//.test(subUrl)) {
+                return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
             }
+            
+            const result = { count: 0, userInfo: null };
+
+            try {
+                const fetchOptions = {
+                    headers: { 'User-Agent': 'MiSub-Node-Counter/2.0' },
+                    redirect: "follow",
+                    cf: { insecureSkipVerify: true }
+                };
+                const trafficFetchOptions = {
+                    headers: { 'User-Agent': 'Clash for Windows/0.20.39' },
+                    redirect: "follow",
+                    cf: { insecureSkipVerify: true }
+                };
+
+                const trafficRequest = fetch(new Request(subUrl, trafficFetchOptions));
+                const nodeCountRequest = fetch(new Request(subUrl, fetchOptions));
+
+                // --- [核心修正] 使用 Promise.allSettled 替换 Promise.all ---
+                const responses = await Promise.allSettled([trafficRequest, nodeCountRequest]);
+
+                // 1. 处理流量请求的结果
+                if (responses[0].status === 'fulfilled' && responses[0].value.ok) {
+                    const trafficResponse = responses[0].value;
+                    const userInfoHeader = trafficResponse.headers.get('subscription-userinfo');
+                    if (userInfoHeader) {
+                        const info = {};
+                        userInfoHeader.split(';').forEach(part => {
+                            const [key, value] = part.trim().split('=');
+                            if (key && value) info[key] = /^\d+$/.test(value) ? Number(value) : value;
+                        });
+                        result.userInfo = info;
+                    }
+                } else if (responses[0].status === 'rejected') {
+                    // 流量请求失败
+                }
+
+                // 2. 处理节点数请求的结果
+                if (responses[1].status === 'fulfilled' && responses[1].value.ok) {
+                    const nodeCountResponse = responses[1].value;
+                    const text = await nodeCountResponse.text();
+                    let decoded = '';
+                    try { decoded = atob(text.replace(/\s/g, '')); } catch { decoded = text; }
+                    const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//gm);
+                    if (lineMatches) {
+                        result.count = lineMatches.length;
+                    }
+                } else if (responses[1].status === 'rejected') {
+                    // 节点数请求失败
+                }
+                
+                // {{ AURA-X: Modify - 使用存储适配器优化节点计数更新. Approval: 寸止(ID:1735459200). }}
+                // 只有在至少获取到一个有效信息时，才更新数据库
+                if (result.userInfo || result.count > 0) {
+                    const storageAdapter = await getStorageAdapter(env);
+                    const originalSubs = await storageAdapter.get(KV_KEY_SUBS) || [];
+                    const allSubs = JSON.parse(JSON.stringify(originalSubs)); // 深拷贝
+                    const subToUpdate = allSubs.find(s => s.url === subUrl);
+
+                    if (subToUpdate) {
+                        subToUpdate.nodeCount = result.count;
+                        subToUpdate.userInfo = result.userInfo;
+
+                        await storageAdapter.put(KV_KEY_SUBS, allSubs);
+                    }
+                }
+                
+            } catch (e) {
+                // 节点计数处理错误
+            }
+            
+            return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+        }
 
         case '/fetch_external_url': { // New case
             if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
@@ -825,214 +875,6 @@ async function handleApiRequest(request, env) {
 
             } catch (e) {
                 return new Response(JSON.stringify({ error: `Failed to fetch external URL: ${e.message}` }), { status: 500 });
-            }
-        }
-
-        // {{ AURA-X: Add - 批量节点更新API端点. Approval: 寸止(ID:1735459200). }}
-        case '/batch_update_nodes': {
-            if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
-            if (!await authMiddleware(request, env)) {
-                return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
-            }
-
-            try {
-                const { subscriptionIds } = await request.json();
-                if (!Array.isArray(subscriptionIds)) {
-                    return new Response(JSON.stringify({ error: 'subscriptionIds must be an array' }), { status: 400 });
-                }
-
-                const storageAdapter = await getStorageAdapter(env);
-                const allSubs = await storageAdapter.get(KV_KEY_SUBS) || [];
-                const subsToUpdate = allSubs.filter(sub => subscriptionIds.includes(sub.id) && sub.url.startsWith('http'));
-
-                // 并行更新所有订阅的节点信息
-                const updatePromises = subsToUpdate.map(async (sub) => {
-                    try {
-                        const fetchOptions = {
-                            headers: { 'User-Agent': 'MiSub-Batch-Updater/1.0' },
-                            redirect: "follow",
-                            cf: { insecureSkipVerify: true }
-                        };
-
-                        const response = await Promise.race([
-                            fetch(sub.url, fetchOptions),
-                            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
-                        ]);
-
-                        if (response.ok) {
-                            // 更新流量信息
-                            const userInfoHeader = response.headers.get('subscription-userinfo');
-                            if (userInfoHeader) {
-                                const info = {};
-                                userInfoHeader.split(';').forEach(part => {
-                                    const [key, value] = part.trim().split('=');
-                                    if (key && value) info[key] = /^\d+$/.test(value) ? Number(value) : value;
-                                });
-                                sub.userInfo = info;
-                            }
-
-                            // 更新节点数量
-                            const text = await response.text();
-                            let decoded = '';
-                            try {
-                                decoded = atob(text.replace(/\s/g, ''));
-                            } catch {
-                                decoded = text;
-                            }
-                            const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//gm;
-                            const matches = decoded.match(nodeRegex);
-                            sub.nodeCount = matches ? matches.length : 0;
-
-                            return { id: sub.id, success: true, nodeCount: sub.nodeCount };
-                        } else {
-                            return { id: sub.id, success: false, error: `HTTP ${response.status}` };
-                        }
-                    } catch (error) {
-                        return { id: sub.id, success: false, error: error.message };
-                    }
-                });
-
-                const results = await Promise.allSettled(updatePromises);
-                const updateResults = results.map(result =>
-                    result.status === 'fulfilled' ? result.value : { success: false, error: 'Promise rejected' }
-                );
-
-                // 使用存储适配器保存更新后的数据
-                await storageAdapter.put(KV_KEY_SUBS, allSubs);
-
-                return new Response(JSON.stringify({
-                    success: true,
-                    message: '批量更新完成',
-                    results: updateResults
-                }), { headers: { 'Content-Type': 'application/json' } });
-
-            } catch (error) {
-                return new Response(JSON.stringify({
-                    success: false,
-                    message: `批量更新失败: ${error.message}`
-                }), { status: 500 });
-            }
-        }
-
-        case '/debug_subscription': {
-            if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
-            
-            try {
-                const { url: debugUrl, userAgent } = await request.json();
-                if (!debugUrl || typeof debugUrl !== 'string' || !/^https?:\/\//.test(debugUrl)) {
-                    return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
-                }
-                
-                const result = {
-                    url: debugUrl,
-                    userAgent: userAgent || 'MiSub-Debug/1.0',
-                    success: false,
-                    rawContent: '',
-                    processedContent: '',
-                    validNodes: [],
-                    ssNodes: [],
-                    error: null
-                };
-                
-                try {
-                    const response = await fetch(new Request(debugUrl, {
-                        headers: { 'User-Agent': result.userAgent },
-                        redirect: "follow",
-                        cf: { insecureSkipVerify: true }
-                    }));
-                    
-                    if (!response.ok) {
-                        result.error = `HTTP ${response.status}: ${response.statusText}`;
-                        return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
-                    }
-                    
-                    const text = await response.text();
-                    result.rawContent = text.substring(0, 2000); // 限制原始内容长度
-                    
-                    // 处理Base64解码
-                    let processedText = text;
-                    try {
-                        const cleanedText = text.replace(/\s/g, '');
-                        if (isValidBase64(cleanedText)) {
-                            const binaryString = atob(cleanedText);
-                            const bytes = new Uint8Array(binaryString.length);
-                            for (let i = 0; i < binaryString.length; i++) { bytes[i] = binaryString.charCodeAt(i); }
-                            processedText = new TextDecoder('utf-8').decode(bytes);
-                        }
-                    } catch (e) {
-                        // Base64解码失败，使用原始内容
-                    }
-                    
-                    result.processedContent = processedText.substring(0, 2000); // 限制处理后内容长度
-                    
-                    // 提取所有有效节点
-                    const allNodes = processedText.replace(/\r\n/g, '\n').split('\n')
-                        .map(line => line.trim())
-                        .filter(line => /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//.test(line));
-                    
-                    result.validNodes = allNodes.slice(0, 20); // 限制显示节点数量
-                    
-                    // 特别提取SS节点进行分析
-                    result.ssNodes = allNodes.filter(line => line.startsWith('ss://')).map(line => {
-                        try {
-                            const hashIndex = line.indexOf('#');
-                            let baseLink = hashIndex !== -1 ? line.substring(0, hashIndex) : line;
-                            let fragment = hashIndex !== -1 ? line.substring(hashIndex) : '';
-                            
-                            const protocolEnd = baseLink.indexOf('://');
-                            const atIndex = baseLink.indexOf('@');
-                            let analysis = {
-                                original: line,
-                                hasUrlEncoding: false,
-                                fixed: line,
-                                base64Part: '',
-                                credentials: ''
-                            };
-                            
-                            if (protocolEnd !== -1 && atIndex !== -1) {
-                                const base64Part = baseLink.substring(protocolEnd + 3, atIndex);
-                                analysis.base64Part = base64Part;
-                                
-                                if (base64Part.includes('%')) {
-                                    analysis.hasUrlEncoding = true;
-                                    const decodedBase64 = decodeURIComponent(base64Part);
-                                    analysis.fixed = 'ss://' + decodedBase64 + baseLink.substring(atIndex) + fragment;
-                                    
-                                    try {
-                                        analysis.credentials = atob(decodedBase64);
-                                    } catch (e) {
-                                        analysis.credentials = 'Base64解码失败: ' + e.message;
-                                    }
-                                } else {
-                                    try {
-                                        analysis.credentials = atob(base64Part);
-                                    } catch (e) {
-                                        analysis.credentials = 'Base64解码失败: ' + e.message;
-                                    }
-                                }
-                            }
-                            
-                            return analysis;
-                        } catch (e) {
-                            return {
-                                original: line,
-                                error: e.message
-                            };
-                        }
-                    }).slice(0, 10); // 限制SS节点分析数量
-                    
-                    result.success = true;
-                    result.totalNodes = allNodes.length;
-                    result.ssNodesCount = allNodes.filter(line => line.startsWith('ss://')).length;
-                    
-                } catch (e) {
-                    result.error = e.message;
-                }
-                
-                return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
-                
-            } catch (e) {
-                return new Response(JSON.stringify({ error: `调试失败: ${e.message}` }), { status: 500 });
             }
         }
 
@@ -1070,6 +912,7 @@ async function handleApiRequest(request, env) {
     
     return new Response('API route not found', { status: 404 });
 }
+
 // --- 名称前缀辅助函数 (无修改) ---
 function prependNodeName(link, prefix) {
   if (!prefix) return link;
@@ -1352,154 +1195,97 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
                                     if (nameRegex.test(nodeName)) {
                                         return false;
                                     }
-                                } catch (e) { /* 忽略解码错误 */ }
+                                } catch (e) { /* 忽略解析錯誤 */ }
                             }
                         }
                         return true;
                     });
                 }
             }
-            
+
             // 判断是否启用订阅前缀
             const shouldPrependSubscriptions = profilePrefixSettings?.enableSubscriptions ?? 
                 config.prefixConfig?.enableSubscriptions ?? 
                 config.prependSubName ?? true;
-            
-            return (shouldPrependSubscriptions && sub.name)
-                ? validNodes.map(node => prependNodeName(node, sub.name)).join('\n')
-                : validNodes.join('\n');
-        } catch (e) { 
-            // 订阅处理错误，生成错误节点
-            const errorNodeName = `连接错误-${sub.name || '未知'}`;
-            return `trojan://error@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp#${encodeURIComponent(errorNodeName)}`;
+
+            if (shouldPrependSubscriptions && sub.name) {
+                validNodes = validNodes.map(node => prependNodeName(node, sub.name));
+            }
+
+            return validNodes.join('\n');
+        } catch (error) {
+            console.error(`获取订阅失败: ${sub.url}`, error);
+            return '';
         }
     });
-    const processedSubContents = await Promise.all(subPromises);
-    const combinedContent = (processedManualNodes + '\n' + processedSubContents.join('\n'));
-    const uniqueNodesString = [...new Set(combinedContent.split('\n').map(line => line.trim()).filter(line => line))].join('\n');
 
-    // 确保最终的字符串在非空时以换行符结束，以兼容 subconverter
-    let finalNodeList = uniqueNodesString;
-    if (finalNodeList.length > 0 && !finalNodeList.endsWith('\n')) {
-        finalNodeList += '\n';
-    }
+    const subResults = await Promise.allSettled(subPromises);
+    const allSubNodes = subResults
+        .filter(result => result.status === 'fulfilled')
+        .map(result => result.value)
+        .filter(content => content.trim() !== '')
+        .join('\n');
 
-    // 将虚假节点（如果存在）插入到列表最前面
-    if (prependedContent) {
-        return `${prependedContent}\n${finalNodeList}`;
-    }
-    return finalNodeList;
+    const combinedContent = [prependedContent, processedManualNodes, allSubNodes]
+        .filter(content => content && content.trim() !== '')
+        .join('\n');
+
+    return combinedContent;
 }
 
-// --- [核心修改] 订阅处理函数 ---
+// --- 主要的订阅处理函数 ---
 async function handleMisubRequest(context) {
     const { request, env } = context;
     const url = new URL(request.url);
-    const userAgentHeader = request.headers.get('User-Agent') || "Unknown";
+    const pathSegments = url.pathname.split('/').filter(segment => segment !== '');
+    
+    if (pathSegments.length === 0) {
+        return new Response('Missing token', { status: 400 });
+    }
+
+    const token = pathSegments[0];
+    const profileIdentifier = pathSegments[1] || null;
 
     const storageAdapter = await getStorageAdapter(env);
-    const [settingsData, misubsData, profilesData] = await Promise.all([
-        storageAdapter.get(KV_KEY_SETTINGS),
-        storageAdapter.get(KV_KEY_SUBS),
-        storageAdapter.get(KV_KEY_PROFILES)
+    const [allMisubs, allProfiles, config] = await Promise.all([
+        storageAdapter.get(KV_KEY_SUBS).then(res => res || []),
+        storageAdapter.get(KV_KEY_PROFILES).then(res => res || []),
+        storageAdapter.get(KV_KEY_SETTINGS).then(res => migrateConfigSettings(res || defaultSettings))
     ]);
-    const settings = settingsData || {};
-    const allMisubs = misubsData || [];
-    const allProfiles = profilesData || [];
-    // 关键：我们在这里定义了 `config`，后续都应该使用它
-    const config = migrateConfigSettings({ ...defaultSettings, ...settings }); 
 
-    let token = '';
-    let profileIdentifier = null;
-    const pathSegments = url.pathname.replace(/^\/sub\//, '/').split('/').filter(Boolean);
+    const effectiveSubConverter = config.subConverter || 'url.v1.mk';
+    const effectiveSubConfig = config.subConfig || '';
 
-    if (pathSegments.length > 0) {
-        token = pathSegments[0];
-        if (pathSegments.length > 1) {
-            profileIdentifier = pathSegments[1];
-        }
-    } else {
-        token = url.searchParams.get('token');
-    }
+    let targetMisubs = allMisubs;
+    let subName = config.FileName || 'MiSub';
+    let isProfileExpired = false;
 
-    let targetMisubs;
-    let subName = config.FileName;
-    let effectiveSubConverter;
-    let effectiveSubConfig;
-    let isProfileExpired = false; // Moved declaration here
-
-    const DEFAULT_EXPIRED_NODE = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#${encodeURIComponent('您的订阅已失效')}`;
+    const DEFAULT_EXPIRED_NODE = 'trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#%E8%AE%A2%E9%98%85%E5%B7%B2%E8%BF%87%E6%9C%9F';
 
     if (profileIdentifier) {
-
-        // [修正] 使用 config 變量
-        if (!token || token !== config.profileToken) {
-            return new Response('Invalid Profile Token', { status: 403 });
-        }
         const profile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
-        if (profile && profile.enabled) {
-            // Check if the profile has an expiration date and if it's expired
+        if (!profile) {
+            return new Response('Profile not found', { status: 404 });
+        }
 
-            if (profile.expiresAt) {
-                const expiryDate = new Date(profile.expiresAt);
-                const now = new Date();
-                if (now > expiryDate) {
-                    isProfileExpired = true;
-                }
-            }
-
-            if (isProfileExpired) {
-                subName = profile.name; // Still use profile name for filename
-                targetMisubs = [{ id: 'expired-node', url: DEFAULT_EXPIRED_NODE, name: '您的订阅已到期', isExpiredNode: true }]; // Set expired node as the only targetMisub
-            } else {
-                subName = profile.name;
-                const profileSubIds = new Set(profile.subscriptions);
-                const profileNodeIds = new Set(profile.manualNodes);
-                targetMisubs = allMisubs.filter(item => {
-                    const isSubscription = item.url.startsWith('http');
-                    const isManualNode = !isSubscription;
-
-                    // Check if the item belongs to the current profile and is enabled
-                    const belongsToProfile = (isSubscription && profileSubIds.has(item.id)) || (isManualNode && profileNodeIds.has(item.id));
-                    if (!item.enabled || !belongsToProfile) {
-                        return false;
-                    }
-                    return true;
-                });
-            }
-            effectiveSubConverter = profile.subConverter && profile.subConverter.trim() !== '' ? profile.subConverter : config.subConverter;
-            effectiveSubConfig = profile.subConfig && profile.subConfig.trim() !== '' ? profile.subConfig : config.subConfig;
+        if (profile.expiresAt && new Date(profile.expiresAt) < new Date()) {
+            isProfileExpired = true;
+            targetMisubs = [{ url: DEFAULT_EXPIRED_NODE, enabled: true, isExpiredNode: true }];
         } else {
-            return new Response('Profile not found or disabled', { status: 404 });
+            targetMisubs = allMisubs.filter(sub => profile.subscriptionIds.includes(sub.id));
         }
-    } else {
-        // [修正] 使用 config 變量
-        if (!token || token !== config.mytoken) {
-            return new Response('Invalid Token', { status: 403 });
-        }
-        targetMisubs = allMisubs.filter(s => s.enabled);
-        // [修正] 使用 config 變量
-        effectiveSubConverter = config.subConverter;
-        effectiveSubConfig = config.subConfig;
+        subName = profile.name || subName;
     }
 
-    if (!effectiveSubConverter || effectiveSubConverter.trim() === '') {
-        return new Response('Subconverter backend is not configured.', { status: 500 });
+    if (token !== config.mytoken && token !== config.profileToken) {
+        return new Response('Invalid token', { status: 403 });
     }
-    
-    let targetFormat = url.searchParams.get('target');
-    if (!targetFormat) {
-        const supportedFormats = ['clash', 'singbox', 'surge', 'loon', 'base64', 'v2ray', 'trojan'];
-        for (const format of supportedFormats) {
-            if (url.searchParams.has(format)) {
-                if (format === 'v2ray' || format === 'trojan') { targetFormat = 'base64'; } else { targetFormat = format; }
-                break;
-            }
-        }
-    }
+
+    const userAgentHeader = request.headers.get('User-Agent') || '';
+    let targetFormat = url.searchParams.get('target') || '';
+
     if (!targetFormat) {
         const ua = userAgentHeader.toLowerCase();
-        // 使用陣列來保證比對的優先順序
         const uaMapping = [
             // Mihomo/Meta 核心的客戶端 - 需要clash格式
             ['flyclash', 'clash'],
@@ -1643,24 +1429,35 @@ async function getCallbackToken(env) {
     return Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
 }
 
+// --- [核心修改] ES Module 格式的主入口 ---
+export default {
+    async fetch(request, env, ctx) {
+        // 重建 context 对象以保持兼容性
+        const context = {
+            request,
+            env,
+            ctx,
+            waitUntil: ctx.waitUntil.bind(ctx),
+            next: () => new Response('Not Found', { status: 404 })
+        };
 
-// --- [核心修改] Cloudflare Pages Functions 主入口 ---
-export async function onRequest(context) {
-    const { request, env, next } = context;
-    const url = new URL(request.url);
+        const url = new URL(request.url);
 
-    // **核心修改：判斷是否為定時觸發**
-    if (request.headers.get("cf-cron")) {
-        return handleCronTrigger(env);
-    }
+        // **核心修改：判斷是否為定時觸發**
+        if (request.headers.get("cf-cron")) {
+            return handleCronTrigger(env);
+        }
 
-    if (url.pathname.startsWith('/api/')) {
-        const response = await handleApiRequest(request, env);
-        return response;
-    }
-    const isStaticAsset = /^\/(assets|@vite|src)\/./.test(url.pathname) || /\.\w+$/.test(url.pathname);
-    if (!isStaticAsset && url.pathname !== '/') {
-        return handleMisubRequest(context);
-    }
-    return next();
-}
+        if (url.pathname.startsWith('/api/')) {
+            const response = await handleApiRequest(request, env);
+            return response;
+        }
+        
+        const isStaticAsset = /^\/(assets|@vite|src)\/./.test(url.pathname) || /\.\w+$/.test(url.pathname);
+        if (!isStaticAsset && url.pathname !== '/') {
+            return handleMisubRequest(context);
+        }
+        
+        return context.next();
+    },
+};
