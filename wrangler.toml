@@ -2,28 +2,46 @@ name = "misub"
 main = "functions/[[path]].js"
 compatibility_date = "2024-06-13"
 
-# KV 命名空间绑定
-# 这是 wrangler.toml 在Pages项目中最重要的作用
+# 智能存储配置 - 根据可用性自动选择
+# 如果您想只使用 D1，请注释掉 KV 配置
+# 如果您想只使用 KV，请注释掉 D1 配置
+
+# KV 命名空间绑定（可选）
+# 如果您有可用的 KV 命名空间，请取消注释并填入正确的 ID
 [[kv_namespaces]]
 binding = "MISUB_KV"
-id = "9796c49ed5a3405aabbbc066d4686ce3" # 请确保这里是你正确的 KV ID
-preview_id = "db1e91b764d14234b38c0a233878b040" # 请确保这里是你正确的预览 KV ID
+id = "YOUR_KV_NAMESPACE_ID"  # 替换为您的真实 KV 命名空间 ID
+preview_id = "YOUR_PREVIEW_KV_ID"  # 替换为您的预览 KV 命名空间 ID
 
-# D1 数据库绑定
-# 用于替代 KV 存储，解决写入限制问题
+# D1 数据库绑定（推荐）
+# 如果您有可用的 D1 数据库，请取消注释并填入正确的 ID
 [[d1_databases]]
 binding = "MISUB_DB"
 database_name = "misub"
-database_id = "5aecdda9-2803-4d9e-a2f6-ccf436ca34e6" # 请替换为您的 D1 数据库 ID
-preview_database_id = "5aecdda9-2803-4d9e-a2f6-ccf436ca34e6" # 请替换为您的预览 D1 数据库 ID
+database_id = "YOUR_D1_DATABASE_ID"  # 替换为您的真实 D1 数据库 ID
+preview_database_id = "YOUR_D1_DATABASE_ID"  # 替换为您的真实 D1 数据库 ID
 
-# 你也可以在这里定义环境变量，但更推荐在Cloudflare控制面板设置
-[vars]
+# 环境变量配置
+[env.production.vars]
+# 存储类型设置（可选）
+# "auto" = 智能选择（推荐）
+# "d1" = 强制使用 D1
+# "kv" = 强制使用 KV
+STORAGE_TYPE = "auto"
+
+# 应用基础配置
 ADMIN_PASSWORD = "admin"
 COOKIE_SECRET = "a_very_long_random_secret_string"
 
+# 定时任务配置
 [triggers]
-# "*/30" 表示每30分鐘
-# "0 */6 * * *" 表示每6小時
-# 根據您的需要調整 cron 表達式
-crons = ["0 */6 * * *"] 
+# 每6小时执行一次订阅更新
+crons = ["0 */6 * * *"]
+
+# 开发环境配置（可选）
+[env.development]
+# 开发环境可以使用不同的存储配置
+[env.development.vars]
+STORAGE_TYPE = "auto"
+ADMIN_PASSWORD = "admin"
+COOKIE_SECRET = "dev_secret_string"
